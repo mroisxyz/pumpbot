@@ -4,6 +4,9 @@
 // the entire position on a stop, take-profit, trailing stop, or time limit, and sprinkle paced
 // probe round trips so the distinct-coin guardrail is met. Fully deterministic: no clock, no
 // randomness, no environment reads; loops only over batch events and insertion-ordered maps.
+// Performance fix: creation slots are kept in a flat map, trade tapes exist only for the narrow
+// reserve band (or committed mints), and stale tapes are pruned each batch — so each slot's
+// orders stay cheap even across a huge universe of mints.
 
 import { runBot, LAMPORTS_PER_SOL } from './vendor/makefun-bot.ts';
 import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
@@ -52,9 +55,9 @@ interface Trade {
   price: number;
 }
 interface Tape {
-  created: number | null;
   trades: Trade[];
   lastExit: number;
+  lastTapeSlot: number;
 }
 interface Held {
   opened: number;
@@ -64,6 +67,8 @@ interface Held {
   lastValue: number;
 }
 
+// Performance: creation slots live in a tiny map; tapes are lazy and only for candidate mints.
+const createdSlots = new Map<Pubkey, number>();
 const tapes = new Map<Pubkey, Tape>();
 const held = new Map<Pubkey, Held>();
 /** Probe round trips in flight, by mint. */
@@ -76,16 +81,16 @@ let lastTime: number | null = null;
 function tapeOf(mint: Pubkey): Tape {
   let t = tapes.get(mint);
   if (t === undefined) {
-    t = { created: null, trades: [], lastExit: -1e12 };
+    t = { trades: [], lastExit: -1e12, lastTapeSlot: -1e12 };
     tapes.set(mint, t);
   }
   return t;
 }
 
-/** Momentum entry test on a mint's rolling tape. */
-function entrySignal(t: Tape, now: number, rqSol: number): boolean {
+/** Momentum entry test on a mint's rolling tape; the creation slot comes from the light map. */
+function entrySignal(t: Tape, now: number, rqSol: number, created: number): boolean {
   if (rqSol < P.minRqSol || rqSol > P.maxRqSol) return false;
-  if (t.created === null || now - t.created < P.minAge) return false;
+  if (now - created < P.minAge) return false;
   const from = now - P.window;
   const mid = now - P.window / 2;
   let buySol = 0;
@@ -142,7 +147,12 @@ const bot: Bot = {
       }
     }
 
-    // Fold this slot's events into tapes and block-time pacing.
+    // Fold this slot's events into tapes and block-time pacing. Only mints near the entry
+    // reserve band (or already committed) get a tape: the thousands of other curves stay cheap.
+    const committed = new Set<Pubkey>(state.positions.keys());
+    for (const po of state.pending.values()) committed.add(po.order.mint);
+    for (const m of held.keys()) committed.add(m);
+    for (const m of probes.keys()) committed.add(m);
     const traded = new Set<Pubkey>();
     for (const e of batch.events) {
       if (e.block_time !== null) {
@@ -150,22 +160,28 @@ const bot: Bot = {
         if (lastTime === null || e.block_time > lastTime) lastTime = e.block_time;
       }
       if (e.event === 'CreateEvent') {
-        tapeOf(e.mint).created = e.slot;
+        createdSlots.set(e.mint, e.slot);
       } else if (e.event === 'TradeEvent') {
-        const t = tapeOf(e.mint);
-        const sol = Number(e.sol_amount) / LAM;
-        t.trades.push({
-          slot: e.slot,
-          buy: e.is_buy,
-          sol,
-          user: e.user,
-          price: Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves),
-        });
         traded.add(e.mint);
+        const rqSol = Number(e.real_quote_reserves) / LAM;
+        const nearBand = rqSol >= P.minRqSol - 1 && rqSol <= P.maxRqSol + 2;
+        if (nearBand || committed.has(e.mint)) {
+          const t = tapeOf(e.mint);
+          const sol = Number(e.sol_amount) / LAM;
+          t.trades.push({
+            slot: e.slot,
+            buy: e.is_buy,
+            sol,
+            user: e.user,
+            price: Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves),
+          });
+          t.lastTapeSlot = e.slot;
+        }
       }
     }
     for (const mint of traded) {
-      const t = tapes.get(mint)!;
+      const t = tapes.get(mint);
+      if (t === undefined) continue;
       let cut = 0;
       while (cut < t.trades.length && t.trades[cut]!.slot <= now - P.keep) cut++;
       if (cut > 0) t.trades.splice(0, cut);
@@ -223,7 +239,7 @@ const bot: Bot = {
       orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: P.sellSlipBps });
     }
 
-    // 3) Momentum entries.
+    // 3) Momentum entries. Cheap filters reject most mints before any tape scan on this slot.
     let free = Number(state.freeCashLamports()) / LAM;
     let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
     let mainLeft = P.maxMain - held.size;
@@ -232,10 +248,14 @@ const bot: Bot = {
       const curve = state.curves.get(mint);
       if (curve === undefined || curve.complete) continue;
       if (pendingByMint.has(mint) || probes.has(mint) || held.has(mint)) continue;
-      const t = tapes.get(mint)!;
-      if (now - t.lastExit < P.cooldown) continue;
+      const created = createdSlots.get(mint);
+      if (created === undefined || now - created < P.minAge) continue;
       const rqSol = Number(curve.real_quote_reserves) / LAM;
-      if (!entrySignal(t, now, rqSol)) continue;
+      if (rqSol < P.minRqSol || rqSol > P.maxRqSol) continue;
+      const t = tapes.get(mint);
+      if (t === undefined) continue;
+      if (now - t.lastExit < P.cooldown) continue;
+      if (!entrySignal(t, now, rqSol, created)) continue;
       if (slotsLeft <= 0 || mainLeft <= 0) continue;
       let amount = Math.min(P.mainBuySol, Number(state.maxBuyLamports(mint)) / LAM);
       if (amount > free - tx) amount = free - tx;
@@ -267,6 +287,12 @@ const bot: Bot = {
           free -= P.probeSol + tx;
         }
       }
+    }
+
+    // 5) Bound memory: drop stale tapes nothing active can use on a later batch or slot.
+    for (const [mint, t] of tapes) {
+      if (t.lastTapeSlot >= now - P.keep || committed.has(mint) || held.has(mint) || probes.has(mint)) continue;
+      tapes.delete(mint);
     }
 
     return orders;
